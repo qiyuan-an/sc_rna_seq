@@ -1,0 +1,152 @@
+---
+title: "Single cell RNA Seq Analysis"
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-11-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+A molecular census of midbrain dopaminergic neurons in Parkinsons disease - Preprint Data
+
+https://singlecell.broadinstitute.org/single_cell/study/SCP1402/a-molecular-census-of-midbrain-dopaminergic-neurons-in-parkinsons-disease-preprint-data#study-download
+
+```{r}
+# library(dplyr)
+# library(Seurat)
+library(patchwork)
+library(ggplot2)
+lapply(c("dplyr","Seurat","HGNChelper"), library, character.only = T)
+```
+
+Read data
+
+```{r}
+pbmc.data <- Read10X(data.dir="D:/R/hw4/data")
+# remove NA row
+na_row_index <- which(is.na(rownames(pbmc.data)))
+pbmc.data <- pbmc.data[-na_row_index,]
+# pbmc.data.sample <- Read10X(data.dir = "D:/R/filtered_gene_bc_matrices/hg19")
+pbmc <- CreateSeuratObject(counts=pbmc.data, project="pd", min.cells = 3, min.features = 100)
+```
+QC and filtering
+Not sure why the plot of nCount_RNA vs percent.mt is always 0 even if I tried many different patterns.
+There is a problem using the regex to find the RNA names so the first plot looks weird.
+```{r}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern="^PD-") # ^ means start from the beginning of the string
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1
+plot2
+```
+```{r}
+pbmc <- subset(pbmc, subset = nFeature_RNA > 2000 & nCount_RNA > 2500)
+```
+
+Normalize
+
+```{r}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(pbmc), 10)
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = T)
+plot1 + plot2
+```
+
+Scale the data
+```{r}
+all.genes <- rownames(pbmc)
+prescaling <- pbmc
+pbmc <- ScaleData(pbmc, features = all.genes)
+```
+Run linear demensionality reduction
+```{r}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+print(pbmc[["pca"]], dims = 1:2, nfeatures = 50)
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+DimHeatmap(pbmc, dims = 1, cells = 500)
+DimHeatmap(pbmc, dims = 1:15, cells = 500)
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+Cluster
+```{r}
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+head(Idents(pbmc), 5)
+```
+
+
+Run non-linear demensionality reduction
+```{r}
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+DimPlot(pbmc, reduction = "umap")
+```
+
+Assign biological meanings to these clusters
+```{r}
+# FindAllMarkers does clustering
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = T, min.pct = 0.25, logfc.threshold = 0.25, )
+pbmc.markers %>% group_by(cluster) %>% slice_max(n=3, order_by =avg_log2FC)
+# FeaturePlot(pbmc, features = c("UNC5C", "LMO3", 'PAM', ''))  # genes
+
+FeaturePlot(pbmc, features = pbmc.markers$gene[109:108])
+```
+
+Find cell type from: https://github.com/IanevskiAleksandr/sc-type/
+
+```{r}
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+# try different tissues
+tissue = "Brain" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = pbmc[["RNA"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+# NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix. 
+# In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default), pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+# or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(pbmc@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(pbmc@meta.data[pbmc@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(pbmc@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+```
+Since my dataset is about Parkinson's disease. I first focused on the brain tissue to find related cell type.
+I found: Cluster 0, 1, 4 are from brain. Cluster 4 is from lung. cluster 0 from adrenal. But cluster 1 is unknown in all tissues. Perhaps the tissues list is not complete enough to find the related cell type.
+This automated tool (sc-type) I used can't find all cell types in our gene list. Since the dataset I used is about Parkinson's disease, this tool's database maybe not have enough cell types in the brain.
+
+
+Literature survey # talk to a biologist, in my case, I need 6 clusters
+Each point is a cell, each cluster is a type of cell.
+```{r}
+new.cluster.ids <- c("Megakaryocytes", "Unknown", "Microglial cells", "GABAergic neurons", "Mesothelial cells", "Oligodendrocytes")
+names(new.cluster.ids) <- levels(pbmc)
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+DimPlot(pbmc, reduction = "umap", label = T, pt.size = 0.5)+NoLegend()
+
+```
+
